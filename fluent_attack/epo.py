@@ -2,37 +2,15 @@
 This file implements the EPO algorithm. See the `epo` function for the main entrypoint.
 """
 
-import contextlib
 import dataclasses
 import time
-from typing import Callable, Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Union
 
 import numpy as np
 import torch
 import torch.distributions
 import torch.nn.functional as F
 import transformers
-
-
-@contextlib.contextmanager
-def add_fwd_hooks(module_hooks: List[Tuple[torch.nn.Module, Callable]]):
-    """
-    Context manager for temporarily adding forward hooks to a model.
-
-    Parameters
-    ----------
-    module_hooks
-        A list of pairs: (module, fnc) The function will be registered as a
-            forward hook on the module
-    """
-    try:
-        handles = []
-        for mod, hk in module_hooks:
-            handles.append(mod.register_forward_hook(hk))
-        yield
-    finally:
-        for h in handles:
-            h.remove()
 
 
 @dataclasses.dataclass
@@ -87,7 +65,9 @@ class History:
         self.ids.append(ids.cpu().numpy())
         self.target.append(target.cpu().numpy())
         self.xentropy.append(xentropy.cpu().numpy())
-        self.token_grads.append(token_grads.cpu().numpy())
+        self.token_grads.append(
+            token_grads.cpu().numpy() if token_grads is not None else None
+        )
         self.keep.append(keep.cpu().numpy())
         self.parents.append(parents.cpu().numpy())
         self.runtime.append(runtime)
@@ -241,6 +221,7 @@ def epo(
         A History object containing the full history of the EPO run.
     """
     start = time.time()
+    iter_start = start
     explore_size = population_size * explore_per_pop
     device = model.device
 
@@ -264,7 +245,9 @@ def epo(
         ).to(device)
 
     if callback is None:
-        callback = pareto_callback(objective, model, tokenizer)
+        callback = pareto_callback(
+            objective, model, tokenizer, x_penalty_min, x_penalty_max
+        )
     elif callback is False:
         callback = lambda *x: True
 
@@ -296,8 +279,7 @@ def epo(
     if hasattr(objective, "setup"):
         objective.setup(input_ids)
 
-    allowed_clock = 0
-    allowed_positions = torch.arange(input_ids.shape[1], device=device)
+    effort = torch.full((input_ids.shape[1],), 1.0, device=device, dtype=torch.float)
     # We use a try/except block so that we can catch keyboard interrupts and
     # still return results. This is useful for interactive use when it's nice
     # to launch with a large `iters` parameter and then just stop the run when
@@ -306,29 +288,20 @@ def epo(
         #### Run the EPO loop: ####
         for i in range(iters):
             if i % elongate_freq == 0 and i > 0 and elongate_factor > 0:
-                allowed_positions = torch.arange(
-                    input_ids.shape[1],
-                    input_ids.shape[1] + elongate_factor,
-                    device=device,
-                )
-                allowed_clock = 3
                 for e in range(elongate_factor):
-                    replace_ids = torch.cat(
-                        (
-                            torch.tile(
-                                input_ids.clone()[:, None], (1, explore_per_pop, 1)
-                            ),
-                            torch.empty(
-                                (population_size, explore_per_pop, 1),
-                                dtype=torch.long,
-                                device=device,
-                            ),
-                        ),
-                        dim=2,
+                    replace_ids = torch.empty(
+                        (input_ids.shape[0], explore_per_pop, input_ids.shape[1] + 1),
+                        dtype=torch.long,
+                        device=device,
                     )
-                    replace_ids[:, :, -1] = (
+                    insert_idx = input_ids.shape[1] // 2
+                    replace_ids[:, :, :insert_idx] = input_ids[:, None, :insert_idx]
+                    replace_ids[:, :, insert_idx] = (
                         model(input_ids).logits[0, -1].topk(explore_per_pop).indices
                     )
+                    replace_ids[:, :, insert_idx + 1 :] = input_ids[
+                        :, None, insert_idx:
+                    ]
                     elongate_state = evaluate_fitness(
                         objective,
                         replace_ids.reshape((-1, replace_ids.shape[-1])),
@@ -341,6 +314,9 @@ def epo(
                     )
                     best_idx = elongate_loss.argmin(dim=-1)
                     input_ids = replace_ids[torch.arange(population_size), best_idx]
+                effort = torch.cat(
+                    (torch.full((elongate_factor,), 1.0, device=device), effort)
+                )
 
             state = token_grads(
                 objective, model, input_ids, x_penalty=X, batch_size=batch_size
@@ -349,7 +325,7 @@ def epo(
             ########################################
             # 1) Report!
             ########################################
-            terminate_flag = callback(i, state, time.time() - start, history)
+            terminate_flag = callback(i, state, time.time() - iter_start, history)
             if (
                 (isinstance(terminate_flag, str) and terminate_flag == "terminate")
                 or (isinstance(terminate_flag, torch.Tensor) and terminate_flag.item())
@@ -360,14 +336,14 @@ def epo(
                         ids=state.ids,
                         target=state.target,
                         xentropy=state.xentropy,
-                        token_grads=state.token_grads,
+                        token_grads=None,  # state.token_grads,
                         keep=torch.arange(population_size),
                         parents=torch.full(population_size, -1, dtype=torch.int),
-                        runtime=time.time() - start,
+                        runtime=time.time() - iter_start,
                     )
                 break
             else:
-                start = time.time()
+                iter_start = time.time()
 
             ########################################
             # 2) Birth children from parents
@@ -386,18 +362,16 @@ def epo(
             # 3) GCG-style mutation
             ########################################
             ranking = (-state.token_grads).topk(k=topk, dim=-1)
-            if allowed_clock > 0:
-                allowed_clock -= 1
-            else:
-                allowed_positions = torch.arange(input_ids.shape[1], device=device)
-            pos = allowed_positions[
-                torch.randint(
-                    low=0,
-                    high=allowed_positions.shape[0],
-                    size=(new_ids.shape[0],),
-                    device=device,
-                )
-            ]
+            pos_scores = (1.0 / effort) ** 2
+            pos_scores /= pos_scores.sum()
+            pos = torch.multinomial(pos_scores, new_ids.shape[0], replacement=True)
+            effort += pos_scores
+            # pos = torch.randint(
+            #     low=0,
+            #     high=input_ids.shape[1],
+            #     size=(new_ids.shape[0],),
+            #     device=device,
+            # )
             token_idx = torch.randint(
                 low=0,
                 high=topk,
@@ -433,8 +407,7 @@ def epo(
                 )
                 parents[~is_fresh] = keep[~is_fresh]
             else:
-                is_fresh = torch.ones(population_size, dtype=torch.bool, device=device)
-                parents = source_idx[keep[is_fresh]].to(parents.dtype)
+                parents = source_idx[keep].to(parents.dtype)
 
             history_token_grads = state.token_grads
             history._insert(
@@ -444,7 +417,7 @@ def epo(
                 token_grads=history_token_grads,
                 keep=keep,
                 parents=parents,
-                runtime=time.time() - start,
+                runtime=time.time() - iter_start,
             )
 
             input_ids = all_state.ids[keep]
@@ -457,7 +430,7 @@ def epo(
         else:
             raise
 
-    terminate_flag = callback(i, state, time.time() - start, history, final=True)
+    terminate_flag = callback(i, state, time.time() - iter_start, history, final=True)
 
     return history
 
@@ -556,7 +529,6 @@ def token_grads(
     input_ids: torch.Tensor,
     x_penalty: torch.Tensor,
     batch_size: int = 1,
-    embedding_noise_mag: float = None,
 ):
     """
     Compute gradients with respect to one-hot encoded input tokens. This is a
@@ -587,19 +559,7 @@ def token_grads(
             )
             one_hot.requires_grad = True
 
-            if embedding_noise_mag is not None:
-                embedding_noise = torch.normal(
-                    0.0,
-                    embedding_noise_mag,
-                    one_hot.shape,
-                    dtype=one_hot.dtype,
-                    device=one_hot.device,
-                )
-                noise_one_hot = one_hot + embedding_noise
-                scaled_one_hot = noise_one_hot / noise_one_hot.sum(dim=-1, keepdim=True)
-            else:
-                scaled_one_hot = one_hot
-            inputs_embeds = torch.matmul(scaled_one_hot, embed.weight)
+            inputs_embeds = torch.matmul(one_hot, embed.weight)
 
             out = objective(input_ids=input_ids, inputs_embeds=inputs_embeds)
 
@@ -656,10 +616,15 @@ def evaluate_fitness(
     xentropy = torch.empty(
         input_ids.shape[0], dtype=torch.float, device=input_ids.device
     )
+    retok_ids = torch.empty_like(input_ids)
     extra = dict()
     for i in range(0, input_ids.shape[0], batch_size):
         imax = min(i + batch_size, input_ids.shape[0])
         out = objective(input_ids=input_ids[i:imax])
+        if "retok_ids" in out:
+            retok_ids[i:imax] = out["retok_ids"]
+        else:
+            retok_ids[i:imax] = input_ids[i:imax]
         target[i:imax] = out["target"]
         xentropy[i:imax] = calc_xentropy(out["logits"], input_ids[i:imax])
 
@@ -674,19 +639,28 @@ def evaluate_fitness(
                     )
                 extra[k][i:imax] = e
 
-    return State(input_ids, target, xentropy, None, extra)
+    return State(retok_ids, target, xentropy, None, extra)
 
 
-def pareto_callback(objective, model, tokenizer):
+def pareto_callback(objective, model, tokenizer, x_penalty_min, x_penalty_max):
     def f(i, state, last_runtime, history, final=False):
         if last_runtime is not None:
             print("runtime: {:.2f} seconds".format(last_runtime))
         print(f"\nbeginning step {i}, current pareto frontier prompts:")
         last_idx = None
 
-        Xvs = torch.exp(torch.linspace(np.log(0.001), np.log(100), 400)).to(
-            model.device
-        )
+        if x_penalty_min is None or x_penalty_max is None:
+            Xvs = torch.tensor([0], device=model.device)
+        else:
+            Xvs = torch.cat(
+                (
+                    torch.exp(
+                        torch.linspace(
+                            np.log(x_penalty_min / 10), np.log(x_penalty_max * 10), 400
+                        )
+                    ),
+                )
+            ).to(model.device)
         loss = -state.target[None] + Xvs[:, None] * state.xentropy[None]
         idxs = loss.argmin(dim=1)
         for i in range(len(Xvs)):
