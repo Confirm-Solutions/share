@@ -1,0 +1,8 @@
+*.pt
+*.csv
+*.json
+*.swp
+*.txt
+*.arrow
+config/
+wandb/
